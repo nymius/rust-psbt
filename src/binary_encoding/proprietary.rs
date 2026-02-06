@@ -2,7 +2,7 @@
 //!
 pub(crate) use encoding::{ByteVecDecoder, BytesEncoder, Decoder, Encoder};
 use encoding::{
-    ByteVecDecoderError, CompactSizeDecoder, CompactSizeDecoderError, CompactSizeEncoder, Encoder2,
+    ArrayDecoder, ArrayEncoder, ByteVecDecoderError, CompactSizeDecoder, CompactSizeDecoderError, CompactSizeEncoder, Encoder2, UnexpectedEofError
 };
 
 use crate::binary_encoding::{PsbtDecodable, PsbtDecoder, PsbtEncodable, PsbtEncoder};
@@ -12,32 +12,31 @@ use crate::prelude::Vec;
 ///
 /// - `<keypair> := <key> <value>`
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub struct ProprietaryKey {
+pub struct ProprietaryKey<const N: usize> {
     /// Proprietary type prefix used for grouping together keys under some
     /// application and avoid namespace collision
     pub prefix: Vec<u8>,
     /// Custom proprietary subtype
     pub subtype: u64,
     /// Additional key bytes (like serialized public key data etc)
-    pub key: Vec<u8>,
+    pub subkeydata: [u8; N],
 }
 
 /// TODO
-pub struct PsbtProprietaryKeyEncoder<'a> {
+pub struct PsbtProprietaryKeyEncoder<'a, const N: usize> {
     enc_idx: usize,
     prefix: Encoder2<CompactSizeEncoder, BytesEncoder<'a>>,
     subtype: CompactSizeEncoder,
-    key: BytesEncoder<'a>,
+    subkeydata: ArrayEncoder<N>,
 }
 
-impl<'a> PsbtEncoder for PsbtProprietaryKeyEncoder<'a> {
+impl<'a, const N: usize> PsbtEncoder for PsbtProprietaryKeyEncoder<'a, N> {
     #[inline]
     fn current_chunk(&self) -> &[u8] {
         match self.enc_idx {
             0 => self.prefix.current_chunk(),
             1 => self.subtype.current_chunk(),
-            _ => self.key.current_chunk(),
+            _ => self.subkeydata.current_chunk(),
         }
     }
 
@@ -56,14 +55,14 @@ impl<'a> PsbtEncoder for PsbtProprietaryKeyEncoder<'a> {
                 }
                 true
             }
-            _ => self.key.advance(),
+            _ => self.subkeydata.advance(),
         }
     }
 }
 
-impl PsbtEncodable for ProprietaryKey {
+impl<const N: usize> PsbtEncodable for ProprietaryKey<N> {
     type Encoder<'a>
-        = PsbtProprietaryKeyEncoder<'a>
+        = PsbtProprietaryKeyEncoder<'a, N>
     where
         Self: 'a;
 
@@ -75,7 +74,7 @@ impl PsbtEncodable for ProprietaryKey {
                 BytesEncoder::without_length_prefix(&self.prefix),
             ),
             subtype: CompactSizeEncoder::new(self.subtype as usize),
-            key: BytesEncoder::without_length_prefix(&self.key),
+            subkeydata: ArrayEncoder::without_length_prefix(self.subkeydata),
         }
     }
 }
@@ -87,6 +86,8 @@ pub enum PsbtProprietaryKeyDecoderError {
     Prefix(ByteVecDecoderError),
     /// TODO
     Subtype(CompactSizeDecoderError),
+    /// TODO
+    SubKeyData(UnexpectedEofError),
 }
 
 impl alloc::fmt::Display for PsbtProprietaryKeyDecoderError {
@@ -96,39 +97,40 @@ impl alloc::fmt::Display for PsbtProprietaryKeyDecoderError {
         match self {
             E::Prefix(ref e) => write!(f, "proprietary key decoder error: {}", e),
             E::Subtype(ref e) => write!(f, "proprietary key decoder error: {}", e),
+            E::SubKeyData(ref e) => write!(f, "proprietary key decoder error: {}", e),
         }
     }
 }
 
-impl PsbtDecodable for ProprietaryKey {
-    type Decoder = PsbtProprietaryKeyDecoder;
+impl<const N: usize> PsbtDecodable for ProprietaryKey<N> {
+    type Decoder = PsbtProprietaryKeyDecoder<N>;
     fn decoder() -> Self::Decoder { PsbtProprietaryKeyDecoder::new() }
 }
 
 /// TODO
-pub struct PsbtProprietaryKeyDecoder {
+pub struct PsbtProprietaryKeyDecoder<const N: usize> {
     prefix_decoder: ByteVecDecoder,
     subtype_decoder: CompactSizeDecoder,
-    remaining_bytes: Option<Vec<u8>>,
+    subkeydata_decoder: ArrayDecoder<N>,
 }
 
-impl PsbtProprietaryKeyDecoder {
+impl<const N: usize> PsbtProprietaryKeyDecoder<N> {
     /// Constructs a new [`TxOut`] decoder.
     pub const fn new() -> Self {
         Self {
             prefix_decoder: ByteVecDecoder::new(),
             subtype_decoder: CompactSizeDecoder::new(),
-            remaining_bytes: None,
+            subkeydata_decoder: ArrayDecoder::<N>::new(),
         }
     }
 }
 
-impl Default for PsbtProprietaryKeyDecoder {
+impl<const N: usize> Default for PsbtProprietaryKeyDecoder<N> {
     fn default() -> Self { Self::new() }
 }
 
-impl PsbtDecoder for PsbtProprietaryKeyDecoder {
-    type Output = ProprietaryKey;
+impl<const N: usize> PsbtDecoder for PsbtProprietaryKeyDecoder<N> {
+    type Output = ProprietaryKey<N>;
     type Error = PsbtProprietaryKeyDecoderError;
 
     #[inline]
@@ -151,9 +153,7 @@ impl PsbtDecoder for PsbtProprietaryKeyDecoder {
             return Ok(subtype_state);
         }
 
-        self.remaining_bytes = Some((*bytes).to_vec());
-
-        Ok(false)
+        self.subkeydata_decoder.push_bytes(bytes).map_err(PsbtProprietaryKeyDecoderError::SubKeyData)
     }
 
     #[inline]
@@ -165,11 +165,10 @@ impl PsbtDecoder for PsbtProprietaryKeyDecoder {
             "the maximum encodable value in a compact size unsigned integer fits within u64",
         );
 
-        if let Some(key) = self.remaining_bytes {
-            Ok(ProprietaryKey { prefix, subtype, key })
-        } else {
-            Ok(ProprietaryKey { prefix, subtype, key: vec![] })
-        }
+        let subkeydata = self.subkeydata_decoder.end().map_err(PsbtProprietaryKeyDecoderError::SubKeyData)?;
+
+
+        Ok(ProprietaryKey { prefix, subtype, subkeydata })
     }
 
     #[inline]
@@ -180,7 +179,13 @@ impl PsbtDecoder for PsbtProprietaryKeyDecoder {
             return prefix_limit;
         }
 
-        self.subtype_decoder.read_limit()
+        let subtype_limit = self.subtype_decoder.read_limit();
+
+        if subtype_limit > 0 {
+            return subtype_limit;
+        }
+
+        self.subkeydata_decoder.read_limit()
     }
 }
 
@@ -188,7 +193,10 @@ impl PsbtDecoder for PsbtProprietaryKeyDecoder {
 mod tests {
     use super::{ProprietaryKey, PsbtDecodable, PsbtDecoder, PsbtEncodable, PsbtEncoder, Vec};
 
-    fn encode_proprietary_key(proprietary_key: ProprietaryKey) -> Vec<u8> {
+    // Bytes represent the "test_key" string in utf8
+    const TEST_SUBKEYDATA: [u8; 8] = [0x74, 0x65, 0x73, 0x74, 0x5f, 0x6b, 0x65, 0x79];
+
+    fn encode_proprietary_key<const N: usize>(proprietary_key: ProprietaryKey<N>) -> Vec<u8> {
         let mut proprietary_key_encoder = proprietary_key.encoder();
         let mut advance = true;
         let mut encoded = vec![];
@@ -208,7 +216,7 @@ mod tests {
         let original = ProprietaryKey {
             prefix: "prefix".as_bytes().to_vec(),
             subtype: 42u64,
-            key: "test_key".as_bytes().to_vec(),
+            subkeydata: TEST_SUBKEYDATA,
         };
         let encoded = encode_proprietary_key(original.clone());
         let mut proprietary_key_decoder = ProprietaryKey::decoder();
@@ -229,7 +237,7 @@ mod tests {
             let original = ProprietaryKey {
                 prefix: vec![],
                 subtype: 2u64,
-                key: "test_key".as_bytes().to_vec(),
+                subkeydata: TEST_SUBKEYDATA,
             };
             let encoded = encode_proprietary_key(original);
 
@@ -242,7 +250,7 @@ mod tests {
         #[test]
         fn no_key() {
             let original =
-                ProprietaryKey { prefix: "prefix".as_bytes().to_vec(), subtype: 2u64, key: vec![] };
+                ProprietaryKey { prefix: "prefix".as_bytes().to_vec(), subtype: 2u64, subkeydata: [] };
             let encoded = encode_proprietary_key(original);
 
             assert_eq!(&encoded.as_slice(), &[0x06, 0x70, 0x72, 0x65, 0x66, 0x69, 0x78, 0x02]);
@@ -253,7 +261,7 @@ mod tests {
             let original = ProprietaryKey {
                 prefix: "prefix".as_bytes().to_vec(),
                 subtype: 2u64,
-                key: "test_key".as_bytes().to_vec(),
+                subkeydata: TEST_SUBKEYDATA,
             };
             let encoded = encode_proprietary_key(original.clone());
             assert_eq!(
@@ -267,23 +275,9 @@ mod tests {
     }
 
     mod decode {
-        use bitcoin::hex::{test_hex_unwrap as hex, DisplayHex};
+        use crate::binary_encoding::proprietary::PsbtProprietaryKeyDecoder;
 
         use super::*;
-
-        #[test]
-        fn fake_test() {
-            let prefix_expected = vec![0x70, 0x72, 0x65, 0x66, 0x69, 0x78];
-            let key_expected = vec![0x74, 0x65, 0x73, 0x74, 0x5f, 0x6b, 0x65, 0x79];
-            assert_eq!(
-                prefix_expected,
-                hex!(&"prefix".as_bytes().to_hex_string(bitcoin::hex::Case::Lower))
-            );
-            assert_eq!(
-                key_expected,
-                hex!(&"test_key".as_bytes().to_hex_string(bitcoin::hex::Case::Lower))
-            );
-        }
 
         #[test]
         fn no_prefix() {
@@ -291,7 +285,7 @@ mod tests {
             let expected = ProprietaryKey {
                 prefix: vec![],
                 subtype: 2u64,
-                key: "test_key".as_bytes().to_vec(),
+                subkeydata: TEST_SUBKEYDATA,
             };
             let mut proprietary_key_decoder = ProprietaryKey::decoder();
             let result = proprietary_key_decoder.push_bytes(&mut bytes.as_slice());
@@ -307,7 +301,7 @@ mod tests {
         fn no_key() {
             let bytes: Vec<u8> = vec![0x06, 0x70, 0x72, 0x65, 0x66, 0x69, 0x78, 0x02];
             let expected =
-                ProprietaryKey { prefix: "prefix".as_bytes().to_vec(), subtype: 2u64, key: vec![] };
+                ProprietaryKey { prefix: "prefix".as_bytes().to_vec(), subtype: 2u64, subkeydata: [] };
             let mut proprietary_key_decoder = ProprietaryKey::decoder();
             let result = proprietary_key_decoder.push_bytes(&mut bytes.as_slice());
 
@@ -327,7 +321,7 @@ mod tests {
             let expected = ProprietaryKey {
                 prefix: "prefix".as_bytes().to_vec(),
                 subtype: 2u64,
-                key: "test_key".as_bytes().to_vec(),
+                subkeydata: TEST_SUBKEYDATA,
             };
             let mut proprietary_key_decoder = ProprietaryKey::decoder();
             let result = proprietary_key_decoder.push_bytes(&mut bytes.as_slice());
@@ -341,13 +335,13 @@ mod tests {
 
         #[test]
         fn initial_read_limit() {
-            let decoder = ProprietaryKey::decoder();
+            let decoder = ProprietaryKey::<8>::decoder();
             assert_eq!(decoder.read_limit(), 1);
         }
 
         #[test]
-        fn early_end_while_decoding_keylen() {
-            let decoder = ProprietaryKey::decoder();
+        fn early_end_while_reading_subtype() {
+            let decoder = ProprietaryKey::<8>::decoder();
             let result = decoder.end();
 
             assert!(result.is_err());
@@ -355,55 +349,70 @@ mod tests {
             assert_eq!(err_str, "proprietary key decoder error: byte vec decoder error: not enough bytes for decoder, 1 more bytes required");
         }
 
-        /*
-
         #[test]
-        fn early_end_while_decoding_type() {
-            let mut decoder = PsbtKeyPairDecoder::new();
-            let mut bytes: &[u8] = &[0x01];
-            let _ = decoder.push_bytes(&mut bytes);
-            // Provide a partial, larger than 1 byte compact size unsigned integer
-            let mut bytes: &[u8] = &[0xfd];
-            let needs_more = decoder.push_bytes(&mut bytes).unwrap();
-            assert!(needs_more); // needs_more should be true, because 0xfd requires 3 bytes
+        fn early_end_while_reading_subkeydata() {
+            let bytes: Vec<u8> = vec![
+                0x06, 0x70, 0x72, 0x65, 0x66, 0x69, 0x78, 0x02
+            ];
 
-            let result = decoder.end();
-            assert!(result.is_err());
-            let err_str = format!("{}", result.unwrap_err());
-            assert_eq!(err_str, "keypair decoder error: early end of key (still decoding type)");
-        }
+            let mut decoder = ProprietaryKey::<8>::decoder();
 
-        #[test]
-        fn push_bytes_incremental_push() {
-            let mut decoder = PsbtKeyPairDecoder::new();
-
-            let full_bytes = vec![0x04, 0x02, 0x01, 0x02, 0x03, 0x02, 0x01, 0x02];
-
-            for byte in full_bytes {
+            for byte in bytes {
                 let mut slice: &[u8] = &[byte];
                 let needs_more = decoder.push_bytes(&mut slice).unwrap();
 
                 assert!(needs_more || slice.is_empty());
             }
 
-            let keypair = decoder.end().unwrap();
-            assert_eq!(
-                keypair,
-                KeyPair {
-                    key: Key { ttype: 0x02, data: vec![0x01, 0x02, 0x03] },
-                    value: vec![0x01, 0x02]
-                }
-            );
+            let result = decoder.end();
+
+            assert!(result.is_err());
+            let err_str = format!("{}", result.unwrap_err());
+            assert_eq!(err_str, "proprietary key decoder error: not enough bytes for decoder, 8 more bytes required");
         }
 
         #[test]
+        fn push_bytes_incremental_push() {
+            let expected = ProprietaryKey {
+                prefix: "prefix".as_bytes().to_vec(),
+                subtype: 2u64,
+                subkeydata: TEST_SUBKEYDATA,
+            };
+
+            let bytes: Vec<u8> = vec![
+                0x06, 0x70, 0x72, 0x65, 0x66, 0x69, 0x78, 0x02
+            ];
+
+            let keydata_bytes: Vec<u8> = vec![0x74, 0x65, 0x73, 0x74, 0x5f, 0x6b, 0x65, 0x79];
+
+            let mut decoder = PsbtProprietaryKeyDecoder::new();
+
+            for byte in bytes {
+                let mut slice: &[u8] = &[byte];
+                let needs_more = decoder.push_bytes(&mut slice).unwrap();
+
+                assert!(needs_more || slice.is_empty());
+            }
+
+            let result = decoder.push_bytes(&mut keydata_bytes.as_slice()).unwrap();
+
+            assert!(!result);
+
+            let decoded = decoder.end().unwrap();
+            assert_eq!(
+                expected,
+                decoded
+            );
+        }
+
+
+        #[test]
         fn empty_slice() {
-            let mut decoder = PsbtKeyPairDecoder::new();
+            let mut decoder = PsbtProprietaryKeyDecoder::<8>::new();
             let mut empty: &[u8] = &[];
 
             let result = decoder.push_bytes(&mut empty).unwrap();
             assert!(result);
         }
-        */
     }
 }
