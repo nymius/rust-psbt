@@ -41,6 +41,7 @@ silent-payments = [] # Silent Payments support
 
 [dependencies]
 bitcoin = { version = "0.32.8", default-features = false }
+encoding = { package = "bitcoin-consensus-encoding", version = "0.1.0", default-features = false, features = [ "alloc" ] }
 
 arbitrary = { version = "1.0.1", optional = true }
 miniscript = { version = "12.3.5", default-features = false, optional = true }
